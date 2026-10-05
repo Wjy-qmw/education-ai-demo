@@ -1,11 +1,9 @@
-from __future__ import annotations
+"""Local printed-text OCR; user confirmation is mandatory before math checks."""
 
-import base64
-import os
+import io, shutil, subprocess, tempfile
 from dataclasses import dataclass
-from typing import Protocol
-
-from openai import OpenAI
+from pathlib import Path
+from PIL import Image
 
 
 @dataclass(frozen=True)
@@ -15,60 +13,31 @@ class VisionResult:
     notice: str
 
 
-class VisionAdapter(Protocol):
-    def extract(self, image_bytes: bytes, mime_type: str) -> VisionResult: ...
-
-
-class DisabledVisionAdapter:
-    def extract(self, image_bytes: bytes, mime_type: str) -> VisionResult:
-        del image_bytes, mime_type
+class TesseractVisionAdapter:
+    def extract(self, image_bytes, mime_type="image/png"):
+        if len(image_bytes) > 10_000_000:
+            raise ValueError("图片超过10MB。")
+        if not shutil.which("tesseract"):
+            raise RuntimeError("服务器未安装文字识别组件，请手动录入。")
+        with Image.open(io.BytesIO(image_bytes)) as im:
+            if im.width * im.height > 8_000_000:
+                raise ValueError("图片像素过大。")
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "image.png"
+                im.convert("RGB").save(path)
+                result = subprocess.run(
+                    ["tesseract", str(path), "stdout", "-l", "eng", "--psm", "6"],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    check=True,
+                )
         return VisionResult(
-            text="",
-            provider="disabled",
-            notice="图片已上传，但当前未启用图片识别。请在下方补充题目文字，或配置 VISION_PROVIDER=deepseek_vision。",
+            result.stdout.strip(),
+            "tesseract",
+            "识别完成。公式可能转写错误，请逐字核对并勾选确认。",
         )
 
 
-class DeepSeekVisionAdapter:
-    def __init__(self) -> None:
-        api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
-        if not api_key:
-            raise RuntimeError("图片识别需要 DEEPSEEK_API_KEY。")
-        self.client = OpenAI(
-            api_key=api_key,
-            base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/"),
-        )
-        self.model = os.getenv("DEEPSEEK_VISION_MODEL", "deepseek-v4-flash")
-
-    def extract(self, image_bytes: bytes, mime_type: str) -> VisionResult:
-        encoded = base64.b64encode(image_bytes).decode("ascii")
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": "请只转写图片中的完整题目文字、公式、选项和图形条件。看不清的部分标记为[无法识别]，不要解题。",
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:{mime_type};base64,{encoded}"},
-                        },
-                    ],
-                }
-            ],
-            temperature=0,
-            max_tokens=1800,
-        )
-        text = response.choices[0].message.content or ""
-        return VisionResult(text=text, provider="deepseek_vision", notice="已由多模态适配层完成题目转写，请核对后再解答。")
-
-
-def get_vision_adapter() -> VisionAdapter:
-    provider = os.getenv("VISION_PROVIDER", "disabled").strip().lower()
-    if provider == "deepseek_vision":
-        return DeepSeekVisionAdapter()
-    return DisabledVisionAdapter()
-
+def get_vision_adapter():
+    return TesseractVisionAdapter()

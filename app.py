@@ -1,28 +1,18 @@
 from __future__ import annotations
-
-import json
-from datetime import datetime
-
+import copy, json, re, hashlib
+from uuid import uuid4
 import streamlit as st
 from dotenv import load_dotenv
-
-from src.deepseek_client import DeepSeekConfigurationError, DeepSeekTutor, demo_answer
-from src.markdown_utils import normalize_markdown_math
-from src.personalization import (
-    build_learning_strategies,
-    build_system_prompt,
-    build_user_prompt,
-    profile_summary,
-)
-from src.questionnaire import QUESTIONS, VALUE_NAMES, normalize_answers, top_values
-from src.storage import load_state, save_state, state_as_json
+from src.deepseek_client import DeepSeekTutor
+from src.questionnaire import QUESTIONS, normalize_answers, top_values, VALUE_NAMES
+from src.storage import SQLiteStore, validate_state, state_as_json
+from src.memory import add_preference, revoke_preference
+from src.service import run_turn
 from src.vision import get_vision_adapter
-
+from src.markdown_utils import normalize_markdown_math
 
 load_dotenv()
-st.set_page_config(page_title="知向教育 · 个性化 AI 解题", page_icon="✦", layout="wide")
-
-
+st.set_page_config(page_title="知向教育 · 证据引导辅学", page_icon="✦", layout="wide")
 CSS = """
 <style>
 :root { --purple:#6350e8; --purple-dark:#4936d2; --ink:#172033; --muted:#7d8698; --line:#ebeaf3; }
@@ -58,286 +48,198 @@ div.stButton > button { border-radius:12px; min-height:2.75rem; }
 st.markdown(CSS, unsafe_allow_html=True)
 
 
-def bootstrap() -> None:
-    if "bootstrapped" in st.session_state:
-        return
-    saved = load_state()
-    st.session_state.profile = saved["profile"]
-    st.session_state.question = saved["question"]
-    st.session_state.history = saved["history"]
-    st.session_state.page = 1 if not saved["profile"] else 2
+store = SQLiteStore()
+identifier = st.query_params.get("session", "")
+if not re.fullmatch(r"[a-f0-9]{32}", identifier):
+    identifier = uuid4().hex
+    st.query_params["session"] = identifier
+if "learner" not in st.session_state or st.session_state.learner != identifier:
+    st.session_state.learner = identifier
+    st.session_state.saved, st.session_state.version = store.load(identifier)
     st.session_state.ocr_text = ""
-    st.session_state.vision_notice = ""
-    st.session_state.bootstrapped = True
 
 
-def persist() -> None:
-    save_state(
-        {
-            "profile": st.session_state.profile,
-            "question": st.session_state.question,
-            "history": st.session_state.history,
-        }
-    )
+def persist(candidate):
+    version = store.save(identifier, candidate, st.session_state.version)
+    st.session_state.saved = candidate
+    st.session_state.version = version
 
 
-def go(page: int) -> None:
-    st.session_state.page = page
-
-
-def render_hero() -> None:
-    st.markdown(
-        """
-        <div class="hero">
-          <span class="eyebrow">✦ 价值观驱动的个性化学习</span>
-          <h1>知向教育 AI 解题</h1>
-          <p>先理解你偏好的学习方式，再理解题目。让每一次讲解不仅正确，也更适合你。</p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    page = st.session_state.page
-    cards = [
-        (1, "▣", "完成价值问卷", "10 道核心题生成 Schwartz 十维 Value Vector"),
-        (2, "⌁", "上传或录入题目", "支持图片适配层与文字输入，提交前可核对题目"),
-        (3, "◯", "获得个性化讲解", "知识点、分步推导、最终答案与连续追问"),
-    ]
-    html = '<div class="steps">'
-    for number, icon, title, desc in cards:
-        active = " active" if number == page else ""
-        html += f'<div class="step-card{active}"><div class="step-top"><span class="step-icon">{icon}</span>Step {number}</div><h3>{title}</h3><p>{desc}</p></div>'
-    html += "</div>"
-    st.markdown(html, unsafe_allow_html=True)
-
-
-def render_profile_sidebar() -> None:
-    with st.sidebar:
-        st.markdown("### 我的学习画像")
-        if not st.session_state.profile:
-            st.caption("完成 10 道核心题后生成")
-        else:
-            vector = normalize_answers(st.session_state.profile)
-            st.caption(f"当前核心偏好：{profile_summary(vector)}")
-            for key, value in vector.items():
-                width = int(value / 5 * 100)
-                st.markdown(
-                    f'<div class="value-row"><span>{VALUE_NAMES[key]}</span><div class="value-track"><div class="value-fill" style="width:{width}%"></div></div><b>{value:.1f}</b></div>',
-                    unsafe_allow_html=True,
-                )
-            if st.button("重新测量", use_container_width=True):
-                go(1)
-                st.rerun()
-
-        st.divider()
-        st.markdown("### 数据与历史")
-        state = {
-            "profile": st.session_state.profile,
-            "question": st.session_state.question,
-            "history": st.session_state.history,
-        }
-        st.download_button(
-            "导出画像与对话",
-            data=state_as_json(state),
-            file_name=f"zhixiang-learning-{datetime.now():%Y%m%d-%H%M}.json",
-            mime="application/json",
-            use_container_width=True,
-        )
-        imported = st.file_uploader("导入历史", type=["json"], label_visibility="collapsed")
-        if imported is not None and st.button("确认导入", use_container_width=True):
-            try:
-                payload = json.loads(imported.getvalue().decode("utf-8"))
-                if not isinstance(payload, dict):
-                    raise ValueError("根节点不是对象")
-                st.session_state.profile = normalize_answers(payload.get("profile", {}))
-                st.session_state.question = str(payload.get("question", ""))
-                history = payload.get("history", [])
-                st.session_state.history = history if isinstance(history, list) else []
-                persist()
-                st.success("已导入")
-                st.rerun()
-            except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-                st.error(f"无法导入：{exc}")
-        if st.button("清空本次题目与对话", use_container_width=True):
-            st.session_state.question = ""
-            st.session_state.history = []
-            persist()
-            st.rerun()
-        st.caption("MVP 默认保存在本机 `data/state.json`；上传的原图不会被持久化。")
-
-
-def render_questionnaire() -> None:
-    st.markdown('<div class="section-card"><h2>先了解你的学习偏好</h2><p>请选择每句话与你的符合程度。这里测量的是讲解偏好，不是能力、成绩或人格好坏。</p></div>', unsafe_allow_html=True)
-    with st.form("value_questionnaire"):
-        answers: dict[str, int] = {}
-        for index, q in enumerate(QUESTIONS, 1):
-            st.markdown(f"**{index:02d}　{q.prompt}**")
-            st.caption(f"{q.name} · {q.english}｜{q.hint}")
-            default = int(st.session_state.profile.get(q.key, 3)) if st.session_state.profile else 3
-            answers[q.key] = st.radio(
-                q.prompt,
-                options=[1, 2, 3, 4, 5],
-                index=default - 1,
-                format_func=lambda value: {1: "很不符合", 2: "不太符合", 3: "一般", 4: "比较符合", 5: "很符合"}[value],
-                horizontal=True,
-                label_visibility="collapsed",
-                key=f"question_{q.key}",
-            )
-            if index < len(QUESTIONS):
-                st.divider()
-        submitted = st.form_submit_button("生成我的学习画像 →", use_container_width=True)
-    if submitted:
-        st.session_state.profile = normalize_answers(answers)
-        persist()
-        go(2)
-        st.rerun()
-
-
-def render_profile_summary() -> None:
-    vector = normalize_answers(st.session_state.profile)
-    top = top_values(vector)
-    chips = "".join(f'<span class="profile-chip">{VALUE_NAMES[key]} {score:.1f}</span>' for key, score in top)
-    strategies = "".join(f'<div class="strategy">{item}</div>' for item in build_learning_strategies(vector))
-    st.markdown(
-        f'<div class="section-card"><h2>你的个性化讲解策略</h2><p>当前最突出的三个价值偏好</p>{chips}<div style="height:.65rem"></div>{strategies}</div>',
-        unsafe_allow_html=True,
-    )
-
-
-def render_question_input() -> None:
-    render_profile_summary()
-    st.markdown('<div class="section-card"><h2>录入你的题目</h2><p>上传题目截图，或直接输入文字。图片识别结果可以在提交前修改。</p></div>', unsafe_allow_html=True)
-
-    left, right = st.columns([1, 1.2], gap="large")
-    with left:
-        uploaded = st.file_uploader("上传题目图片", type=["png", "jpg", "jpeg", "webp"])
-        if uploaded is not None:
-            st.image(uploaded, caption="题目预览", use_container_width=True)
-            if st.button("识别图片中的题目", use_container_width=True):
-                try:
-                    result = get_vision_adapter().extract(uploaded.getvalue(), uploaded.type or "image/jpeg")
-                    st.session_state.ocr_text = result.text
-                    st.session_state.vision_notice = result.notice
-                except Exception as exc:  # provider/network errors should be visible in the demo UI
-                    st.session_state.vision_notice = f"图片识别失败：{exc}。请手动输入题目文字。"
-            if st.session_state.vision_notice:
-                if st.session_state.ocr_text:
-                    st.success(st.session_state.vision_notice)
-                else:
-                    st.info(st.session_state.vision_notice)
-        else:
-            st.info("默认仅保存识别后的文字，不保存原始图片。")
-
-    with right:
-        default_text = st.session_state.ocr_text or st.session_state.question
-        question = st.text_area(
-            "题目文字",
-            value=default_text,
-            height=245,
-            placeholder="例如：已知二次函数 f(x)=x²-4x+3，求它的顶点坐标和零点。",
-        )
-        subject = st.selectbox("学科（用于辅助判断）", ["自动判断", "数学", "语文", "英语", "物理", "化学", "生物", "历史", "其他"])
-        tutor = DeepSeekTutor()
-        if tutor.configured:
-            st.success(f"DeepSeek 已连接 · {tutor.model}")
-        else:
-            st.warning("尚未配置 API Key，将进入明确标注的离线演示模式。")
-        if st.button("开始个性化解答 →", type="primary", use_container_width=True, disabled=not question.strip()):
-            st.session_state.question = question.strip()
-            st.session_state.subject = subject
-            with st.spinner("正在判断知识点并组织适合你的讲解…"):
-                try:
-                    system_prompt = build_system_prompt(st.session_state.profile)
-                    user_prompt = build_user_prompt(f"学科：{subject}\n{question.strip()}")
-                    answer = tutor.answer(system_prompt, user_prompt)
-                    mode = "deepseek"
-                except DeepSeekConfigurationError:
-                    answer = demo_answer(question)
-                    mode = "demo"
-                except Exception as exc:
-                    st.error(f"DeepSeek 调用失败：{exc}")
-                    return
-            st.session_state.history = [
-                {"role": "user", "content": question.strip(), "kind": "question"},
-                {"role": "assistant", "content": answer, "mode": mode},
-            ]
-            persist()
-            go(3)
-            st.rerun()
-
-
-def render_solution() -> None:
-    tutor = DeepSeekTutor()
-    top_left, top_right = st.columns([4, 1])
-    with top_left:
-        st.markdown('<div class="section-card"><h2>个性化解答</h2><p>按照你的学习画像组织知识点、推导顺序与反馈方式。</p></div>', unsafe_allow_html=True)
-    with top_right:
-        if st.button("换一道题", use_container_width=True):
-            st.session_state.question = ""
-            st.session_state.history = []
-            st.session_state.ocr_text = ""
-            persist()
-            go(2)
-            st.rerun()
-
-    if st.session_state.history and st.session_state.history[1].get("mode") == "demo":
-        st.warning("以下是离线演示结构，不包含真实题目答案。配置 DeepSeek API Key 后可生成完整解答。")
-
-    for item in st.session_state.history:
-        role = item.get("role", "assistant")
-        with st.chat_message(role, avatar="🎓" if role == "assistant" else "🧑‍💻"):
-            st.markdown(normalize_markdown_math(item.get("content", "")))
-
-    with st.form("follow_up_form", clear_on_submit=True):
-        follow_up = st.text_input("继续追问", placeholder="例如：第 2 步为什么要这样变形？还有别的方法吗？")
-        ask = st.form_submit_button("发送追问", use_container_width=True)
-    if ask and follow_up.strip():
-        with st.spinner("正在结合原题和你的学习画像继续讲解…"):
-            try:
-                if tutor.configured:
-                    answer = tutor.answer(
-                        build_system_prompt(st.session_state.profile),
-                        build_user_prompt(st.session_state.question, follow_up.strip()),
-                        history=st.session_state.history,
-                    )
-                    mode = "deepseek"
-                else:
-                    answer = demo_answer(follow_up)
-                    mode = "demo"
-            except Exception as exc:
-                st.error(f"追问失败：{exc}")
-                return
-        st.session_state.history.extend(
-            [
-                {"role": "user", "content": follow_up.strip(), "kind": "follow_up"},
-                {"role": "assistant", "content": answer, "mode": mode},
-            ]
-        )
-        persist()
-        st.rerun()
-
-    with st.expander("查看本次结构化个性化 Prompt"):
-        st.caption("用于研究展示与调试；实际产品可默认隐藏。")
-        st.code(build_system_prompt(st.session_state.profile), language="markdown")
-
-
-bootstrap()
-render_profile_sidebar()
-render_hero()
-
-if st.session_state.page == 1:
-    render_questionnaire()
-elif st.session_state.page == 2:
-    if not st.session_state.profile:
-        go(1)
-        st.rerun()
-    render_question_input()
-else:
-    if not st.session_state.history:
-        go(2)
-        st.rerun()
-    render_solution()
-
+state = st.session_state.saved
 st.markdown(
-    '<p class="small-note" style="text-align:center;margin-top:2.5rem">价值画像只用于调整教学表达，不用于预测能力、替代教师判断或自动评分。</p>',
+    '<div class="hero"><span class="eyebrow">✦ 偏好与学习证据共同引导</span><h1>知向教育 AI 辅学</h1><p>今天想要线索，还是完整步骤？让讲解适合当下的你。</p></div>',
     unsafe_allow_html=True,
 )
+with st.sidebar:
+    st.subheader("我的学习空间")
+    st.caption("保留此私有学习链接可恢复记录。链接具有访问权限，请勿公开分享。")
+    if state["profile"]:
+        top = top_values(state["profile"])
+        st.write(
+            "、".join(f"{VALUE_NAMES[k]} {v:.1f}" for k, v in top)
+            or "各项回答相同，暂无突出的偏好。"
+        )
+    st.download_button(
+        "导出学习记录",
+        state_as_json(state),
+        "zhixiang-learning.json",
+        "application/json",
+    )
+    imported = st.file_uploader("导入记录", type=["json"])
+    if imported is not None and st.button("确认导入"):
+        try:
+            candidate = validate_state(json.loads(imported.getvalue().decode("utf-8")))
+            persist(candidate)
+            st.rerun()
+        except (ValueError, UnicodeDecodeError):
+            st.error("记录格式无效或版本已更新，请检查文件并刷新。")
+    st.caption("记录按私有链接隔离。云端本机数据库可能随容器重建丢失，请定期导出。")
+learn, preferences, records = st.tabs(["学习", "画像与记忆", "学习记录"])
+with preferences:
+    st.subheader("学习表达偏好")
+    st.caption("问卷借鉴价值观维度，为项目自编题目；不用于心理诊断或能力预测。")
+    with st.form("questionnaire"):
+        answers = {}
+        for q in QUESTIONS:
+            answers[q.key] = st.slider(
+                q.prompt,
+                1,
+                5,
+                int(state["profile"].get(q.key, 3)),
+                key="value_" + q.key,
+            )
+        submitted = st.form_submit_button("保存学习画像")
+    if submitted:
+        try:
+            candidate = copy.deepcopy(state)
+            candidate["profile"] = normalize_answers(answers)
+            persist(candidate)
+            st.rerun()
+        except ValueError:
+            st.error("记录有变化，请刷新后重试。")
+    st.subheader("我允许记住的偏好")
+    style = st.selectbox(
+        "长期数学讲解偏好",
+        ["hint", "full", "structured"],
+        format_func=lambda v: {
+            "hint": "先给线索",
+            "full": "完整讲解",
+            "structured": "分步结构",
+        }[v],
+    )
+    confirmed = st.checkbox("我确认将这项偏好保存到我的学习记录")
+    if st.button("保存长期偏好", disabled=not confirmed):
+        try:
+            candidate = copy.deepcopy(state)
+            add_preference(candidate["memory"], style, confirmed=True)
+            persist(candidate)
+            st.rerun()
+        except ValueError:
+            st.error("记录有变化，请刷新后重试。")
+    for m in state["memory"]:
+        st.write(
+            f"数学：{m['value']} · 版本{m['version']} · {'生效' if m['active'] else '已撤销'}"
+        )
+        if m["active"] and st.button("撤销这项记忆", key=m["id"]):
+            try:
+                candidate = copy.deepcopy(state)
+                revoke_preference(candidate["memory"], m["id"])
+                persist(candidate)
+                st.rerun()
+            except ValueError:
+                st.error("记录有变化，请刷新后重试。")
+    st.caption("今天的要求优先于长期偏好；同条件的冲突偏好会保留并请求确认。")
+with learn:
+    tutor = DeepSeekTutor()
+    st.caption(
+        f"模型接口已配置 · {tutor.model}；成功响应后才记录调用结果。"
+        if tutor.configured
+        else "本地数学规则模式 · 支持单变量分式，其他题目需模型接口。"
+    )
+    uploaded = st.file_uploader("题目图片（可选）", type=["png", "jpg", "jpeg", "webp"])
+    if uploaded is not None and st.button("识别题目文字"):
+        try:
+            result = get_vision_adapter().extract(uploaded.getvalue(), uploaded.type)
+            st.session_state.ocr_text = result.text
+            st.info(result.notice)
+        except Exception:
+            st.error("文字识别未完成，请手动录入并核对题目。")
+    question = st.text_area(
+        "完整题目",
+        value=st.session_state.ocr_text or state["question"],
+        placeholder="化简 (x^2-1)/(x-1)，写出原式条件。",
+    )
+    reliable = st.checkbox(
+        "我已核对题目文字及公式", value=not bool(st.session_state.ocr_text)
+    )
+    goal = st.text_input(
+        "今天希望怎样帮你？", placeholder="例如：只给提示，不要答案；或：完整讲解"
+    )
+    with st.expander("提交自己的作答（可选）"):
+        answer = st.text_input("我的最终表达式", placeholder="x+1")
+        restriction = st.text_input("原式限制", placeholder="x!=1；多个条件用逗号分隔")
+        independent = st.checkbox("这次作答是在未查看本题答案或提示时独立完成的")
+        st.caption(
+            "只有核验范围内的独立作答才更新模型知识概率；这是状态估计，不是成绩。"
+        )
+    if st.button("获得帮助 / 继续追问", type="primary", disabled=not question.strip()):
+        try:
+            with st.spinner("正在组织讲解并核验…"):
+                candidate, version = run_turn(
+                    store,
+                    identifier,
+                    state,
+                    st.session_state.version,
+                    question.strip(),
+                    goal,
+                    tutor=tutor,
+                    student_answer=answer,
+                    restriction=restriction,
+                    independent=independent,
+                    evidence_id=hashlib.sha256(
+                        (
+                            question.strip()
+                            + "\n"
+                            + answer.strip()
+                            + "\n"
+                            + restriction.strip()
+                        ).encode()
+                    ).hexdigest(),
+                    reliable=reliable,
+                )
+            st.session_state.saved = candidate
+            st.session_state.version = version
+            st.rerun()
+        except Exception:
+            st.error(
+                "本轮未完成：接口、输出核验或记录版本检查未通过。记录未覆盖；请核对题目后重试，或刷新页面。"
+            )
+    for item in state["history"]:
+        with st.chat_message(item["role"]):
+            st.markdown(normalize_markdown_math(item["content"]))
+with records:
+    st.subheader("知识状态与处理记录")
+    st.caption("以下概率来自设计参数的 BKT 更新，尚未经真实学生数据校准。")
+    for skill, label in [
+        ("fraction_simplify", "分式化简"),
+        ("domain_restriction", "原式条件"),
+    ]:
+        st.write(label)
+        st.progress(state["knowledge"]["skills"].get(skill, 0.2))
+    if state["audit"]:
+        st.dataframe(
+            [
+                {
+                    "教学动作": a["action"],
+                    "模式": a["mode"],
+                    "核验范围": a["validation"],
+                    "耗时（秒）": round(a["elapsed_s"], 3),
+                }
+                for a in state["audit"]
+            ],
+            hide_index=True,
+        )
+        with st.expander("查看可追溯的决策依据"):
+            st.json(state["audit"][-1])
+    else:
+        st.info("完成一轮帮助后显示记录。")
