@@ -5,3 +5,6 @@ __pycache__/
 data/state.json
 .venv/
 .DS_Store
+data/*.sqlite3
+data/*.sqlite3-*
+validation-output/

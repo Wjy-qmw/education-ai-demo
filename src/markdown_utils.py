@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import re
 
-
 _CODE_SPAN_OR_BLOCK = re.compile(r"(```[\s\S]*?```|`[^`\n]*`)")
 
 

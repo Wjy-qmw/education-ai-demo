@@ -9,11 +9,15 @@ def build_learning_strategies(vector: dict[str, float]) -> list[str]:
     strategies: list[str] = []
 
     if v["self_direction"] >= 4:
-        strategies.append("自主引导：先给思考线索和可选路径，邀请学生尝试，再揭示完整答案。")
+        strategies.append(
+            "自主引导：先给思考线索和可选路径，邀请学生尝试，再揭示完整答案。"
+        )
     if v["achievement"] >= 4:
         strategies.append("目标激励：说明本题目标、完成标准与一个适度的进阶挑战。")
     if v["security"] >= 4 or v["conformity"] >= 4:
-        strategies.append("清晰结构：使用稳定的编号步骤，明确公式依据、检查点和易错处。")
+        strategies.append(
+            "清晰结构：使用稳定的编号步骤，明确公式依据、检查点和易错处。"
+        )
     if v["stimulation"] >= 4:
         strategies.append("探索变化：在主解法后给出另一种思路、变式或现实类比。")
     if v["benevolence"] >= 4 or v["universalism"] >= 4:
@@ -37,7 +41,9 @@ def profile_summary(vector: dict[str, float]) -> str:
 
 def build_system_prompt(vector: dict[str, float]) -> str:
     v = normalize_answers(vector)
-    vector_text = "\n".join(f"- {VALUE_NAMES[key]}: {score:.1f}/5" for key, score in v.items())
+    vector_text = "\n".join(
+        f"- {VALUE_NAMES[key]}: {score:.1f}/5" for key, score in v.items()
+    )
     strategy_text = "\n".join(f"- {item}" for item in build_learning_strategies(v))
     return f"""你是严谨、耐心的个性化学习教练。你帮助学生理解题目，而不只是抛出答案。
 
